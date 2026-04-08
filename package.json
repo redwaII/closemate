@@ -1,0 +1,22 @@
+{
+  "name": "closemate",
+  "version": "1.0.0",
+  "description": "Telegram bot for freelancer sales objection training",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "db:init": "node scripts/db-init.js",
+    "db:seed": "node scripts/db-seed.js",
+    "test": "echo \"No tests yet\""
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.4.1",
+    "pg": "^8.20.0",
+    "telegraf": "^4.16.3"
+  }
+}
