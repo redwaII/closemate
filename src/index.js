@@ -4,11 +4,24 @@ const { Telegraf, Markup } = require("telegraf");
 const {
   scoreResponse,
   buildImprovedVersion,
+  buildPersonalizedGoodExampleFallback,
   buildShortFeedback,
 } = require("./evaluator");
-const { STATES, getSession, resetToMainMenu } = require("./state");
+const {
+  STATES,
+  getSession,
+  resetToMainMenu,
+  resetSession,
+  pushDialogHistory,
+} = require("./state");
 const { ensureBusinessSchema, getBusinessData } = require("./businessDataRepo");
 const { pool } = require("./db");
+const {
+  isLlmEnabled,
+  generatePersonalizedScenario,
+  generateFeedback,
+  evaluateBugReport,
+} = require("./llm");
 
 const EXPERIENCE_LEVELS = {
   novice: "Новичок",
@@ -31,6 +44,7 @@ const CALLBACK = {
   TRAIN: "menu:train",
   PROGRESS: "menu:progress",
   LEVEL: "menu:level",
+  REPORT_BUG: "menu:report_bug",
   BACK_MENU: "menu:back",
   NEW_SCENARIO: "result:new_scenario",
   RETRY: "result:retry",
@@ -38,6 +52,7 @@ const CALLBACK = {
   LEVEL_PREFIX: "level:",
   PROFILE_START: "profile:start",
   PROFILE_EDIT: "profile:edit",
+  PROFILE_EDIT_CONFIRM: "profile:edit:confirm",
 };
 
 const PROFILE_STEPS = ["niche", "goal"];
@@ -47,18 +62,44 @@ const PROFILE_QUESTIONS = {
   goal: "Какую цель хотите получить от тренажера в ближайший месяц?",
 };
 
+function buildGreetingText(ctx) {
+  const name = ctx.from?.first_name || "друг";
+  return (
+    `Привет, ${name}!\n\n` +
+    `Я тренажёр переговоров в переписке для фрилансеров-разработчиков: отработаем возражения клиентов и дам короткий фидбек по вашему ответу.\n\n` +
+    `Команды:\n` +
+    `/start — приветствие и меню\n` +
+    `/reset — начать с нуля (профиль, прогресс и история)\n` +
+    `/cancel — отмена и возврат в меню`
+  );
+}
+
+function trimForHistory(text, maxLen = 1800) {
+  const t = String(text).trim();
+  if (t.length <= maxLen) return t;
+  return `${t.slice(0, maxLen)}…`;
+}
+
 function mainMenuKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("Выбрать сценарий", CALLBACK.TRAIN)],
     [Markup.button.callback("Мой прогресс", CALLBACK.PROGRESS)],
     [Markup.button.callback("Настройки уровня", CALLBACK.LEVEL)],
     [Markup.button.callback("Изменить профиль", CALLBACK.PROFILE_EDIT)],
+    [Markup.button.callback("Сообщить о проблеме", CALLBACK.REPORT_BUG)],
   ]);
 }
 
 function profileStartKeyboard() {
   return Markup.inlineKeyboard([
     [Markup.button.callback("Заполнить профиль (2 вопроса)", CALLBACK.PROFILE_START)],
+  ]);
+}
+
+function profileEditConfirmKeyboard() {
+  return Markup.inlineKeyboard([
+    [Markup.button.callback("Да, изменить профиль", CALLBACK.PROFILE_EDIT_CONFIRM)],
+    [Markup.button.callback("Отмена", CALLBACK.BACK_MENU)],
   ]);
 }
 
@@ -151,6 +192,102 @@ function getScenarioById(id) {
   return SCENARIOS.find((scenario) => scenario.id === id);
 }
 
+/** Модель иногда копирует примеры «[тип клиента]» из промпта — подменяем на нишу или контекст каталога. */
+function isAiContextPlaceholder(value) {
+  if (typeof value !== "string") return true;
+  const t = value.trim();
+  if (!t) return true;
+  if (/^\[тип\s*клиента\]$/i.test(t)) return true;
+  if (/^\[услуга\]$/i.test(t)) return true;
+  if (/^\[заказчик\]$/i.test(t)) return true;
+  if (/^\[проект\]$/i.test(t)) return true;
+  if (/^\[client\s*type\]$/i.test(t)) return true;
+  if (/^\[service\]$/i.test(t)) return true;
+  const m = t.match(/^\[([^\]]+)\]$/);
+  if (m) {
+    const inner = m[1].trim().toLowerCase();
+    if (
+      inner === "тип клиента" ||
+      inner === "услуга" ||
+      inner === "заказчик" ||
+      inner === "проект" ||
+      inner === "не указана" ||
+      inner === "заглушка"
+    )
+      return true;
+  }
+  return false;
+}
+
+function enrichAiScenario(ai, session, catalogScenario) {
+  const niche = (session.profile?.niche || "").trim();
+  const ctx = catalogScenario?.context || {};
+  const fallbackClient =
+    typeof ctx.clientType === "string" && ctx.clientType.trim()
+      ? ctx.clientType.trim()
+      : "Заказчик (типовой для переписки)";
+  const fallbackProject =
+    typeof ctx.project === "string" && ctx.project.trim()
+      ? ctx.project.trim()
+      : "Проект по договорённости";
+
+  let { client_type, project_hint } = ai.context;
+  if (isAiContextPlaceholder(client_type)) {
+    client_type = niche ? `Заказчик в нише: ${niche}` : fallbackClient;
+  }
+  if (isAiContextPlaceholder(project_hint)) {
+    project_hint = niche ? `Проект в области: ${niche}` : fallbackProject;
+  }
+  return {
+    ...ai,
+    context: {
+      ...ai.context,
+      client_type,
+      project_hint,
+    },
+  };
+}
+
+function formatDbScenarioIntro(session, scenario) {
+  return (
+    `Сценарий: ${scenario.title}\n\n` +
+    `Ваш профиль:\n` +
+    `- Ниша: ${session.profile.niche}\n` +
+    `- Цель: ${session.profile.goal}\n\n` +
+    `Контекст ситуации:\n` +
+    `- Клиент: ${scenario.context.clientType}\n` +
+    `- Проект: ${scenario.context.project}\n` +
+    `- Этап: ${scenario.context.stage}\n` +
+    `- Напряжение: ${scenario.context.pressure}\n\n` +
+    `Челлендж уровня:\n- ${
+      scenario.levelChallenge[session.experienceLevel || "novice"]
+    }\n\n` +
+    `Сообщение клиента:\n"${scenario.clientMessage}"\n\n` +
+    `Цель: ${scenario.goal}\n\n` +
+    `Напишите ваш ответ одним сообщением.`
+  );
+}
+
+function formatAiScenarioIntro(session, scenario, ai) {
+  const level = session.experienceLevel || "novice";
+  return (
+    `Сценарий: ${ai.scenario_title}\n` +
+    `(тип: ${scenario.title})\n\n` +
+    `Ваш профиль:\n` +
+    `- Ниша: ${session.profile.niche}\n` +
+    `- Цель: ${session.profile.goal}\n\n` +
+    `Контекст ситуации:\n` +
+    `- Клиент: ${ai.context.client_type}\n` +
+    `- Проект: ${ai.context.project_hint}\n` +
+    `- Этап: ${ai.context.stage}\n` +
+    `- Напряжение: ${ai.context.tension}\n\n` +
+    `Челлендж уровня:\n- ${ai.level_challenge}\n\n` +
+    `Сообщение клиента:\n"${ai.client_message}"\n\n` +
+    `Цель: ${ai.trainer_goal}\n\n` +
+    `Напишите ваш ответ одним сообщением.`
+  );
+}
+
 function renderScoreBar(score, maxScore) {
   const filled = "█".repeat(score);
   const empty = "░".repeat(Math.max(0, maxScore - score));
@@ -203,10 +340,9 @@ async function showMainMenu(ctx, session) {
   const levelLabel = session.experienceLevel
     ? EXPERIENCE_LEVELS[session.experienceLevel]
     : "не выбран";
-  await ctx.reply(
-    `Тренажер продаж для фрилансеров.\nУровень: ${levelLabel}\n\nВыберите действие:`,
-    mainMenuKeyboard()
-  );
+  const text = `Тренажер продаж для фрилансеров.\nУровень: ${levelLabel}\n\nВыберите действие:`;
+  await ctx.reply(text, mainMenuKeyboard());
+  pushDialogHistory(session, "assistant", text);
 }
 
 function getNextProfileStep(profile) {
@@ -219,33 +355,62 @@ async function askProfileQuestion(ctx, session) {
     session.profile.completed = true;
     session.profile.step = null;
     session.state = STATES.MAIN_MENU;
-    await ctx.reply("Профиль заполнен. Теперь сценарии будут персонализированы под вас.");
+    const done =
+      "Профиль заполнен. Теперь сценарии будут персонализированы под вас.";
+    await ctx.reply(done);
+    pushDialogHistory(session, "assistant", done);
     await showMainMenu(ctx, session);
     return;
   }
 
   session.profile.step = nextStep;
   session.state = STATES.PROFILE_INTAKE;
-  await ctx.reply(PROFILE_QUESTIONS[nextStep]);
+  const q = PROFILE_QUESTIONS[nextStep];
+  await ctx.reply(q);
+  pushDialogHistory(session, "assistant", q);
 }
 
 bot.start(async (ctx) => {
-  const session = getSession(String(ctx.from.id));
-  resetToMainMenu(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  resetToMainMenu(userId);
+  session.dialogHistory = [];
+
+  const greet = buildGreetingText(ctx);
+  await ctx.reply(greet);
+  pushDialogHistory(session, "assistant", greet);
+
   if (!session.profile.completed) {
-    await ctx.reply(
-      "Перед первой тренировкой давайте быстро соберем профиль, чтобы сделать сценарии под вас.",
-      profileStartKeyboard()
-    );
+    const t =
+      "Перед первой тренировкой давайте быстро соберем профиль, чтобы сделать сценарии под вас.";
+    await ctx.reply(t, profileStartKeyboard());
+    pushDialogHistory(session, "assistant", t);
     return;
   }
   await showMainMenu(ctx, session);
 });
 
+bot.command("reset", async (ctx) => {
+  const userId = String(ctx.from.id);
+  await ctx.sendChatAction("typing");
+  resetSession(userId);
+  const session = getSession(userId);
+  const msg =
+    "Готово: профиль, прогресс и история диалога сброшены. Начинаем заново.";
+  await ctx.reply(msg);
+  pushDialogHistory(session, "assistant", msg);
+  const hint =
+    "Заполните профиль двумя короткими ответами — так сценарии будут персональнее.";
+  await ctx.reply(hint, profileStartKeyboard());
+  pushDialogHistory(session, "assistant", hint);
+});
+
 bot.command("cancel", async (ctx) => {
   const session = getSession(String(ctx.from.id));
   resetToMainMenu(String(ctx.from.id));
-  await ctx.reply("Действие отменено.");
+  const t = "Действие отменено.";
+  await ctx.reply(t);
+  pushDialogHistory(session, "assistant", t);
   await showMainMenu(ctx, session);
 });
 
@@ -260,21 +425,21 @@ bot.action(CALLBACK.TRAIN, async (ctx) => {
   await ctx.answerCbQuery();
   const session = getSession(String(ctx.from.id));
   if (!session.profile.completed) {
-    await ctx.reply(
-      "Сначала заполните короткий профиль, чтобы сценарии были адаптированы под вашу ситуацию.",
-      profileStartKeyboard()
-    );
+    const needProfile =
+      "Сначала заполните короткий профиль, чтобы сценарии были адаптированы под вашу ситуацию.";
+    await ctx.reply(needProfile, profileStartKeyboard());
+    pushDialogHistory(session, "assistant", needProfile);
     return;
   }
   const level = getCurrentLevel(session);
   session.state = STATES.SCENARIO_SELECT;
-  await ctx.reply(
+  const trainIntro =
     `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите тип возражения для тренировки.\n${getWeakScenariosHint(
       session,
       level
-    )}`,
-    scenariosKeyboard(session, level)
-  );
+    )}`;
+  await ctx.reply(trainIntro, scenariosKeyboard(session, level));
+  pushDialogHistory(session, "assistant", trainIntro);
 });
 
 bot.action(CALLBACK.PROFILE_START, async (ctx) => {
@@ -286,25 +451,66 @@ bot.action(CALLBACK.PROFILE_START, async (ctx) => {
 bot.action(CALLBACK.PROFILE_EDIT, async (ctx) => {
   await ctx.answerCbQuery();
   const session = getSession(String(ctx.from.id));
+  const warn =
+    "Внимание: при изменении профиля текущий прогресс прохождения будет сброшен, и тренировка начнется заново. Продолжить?";
+  await ctx.reply(warn, profileEditConfirmKeyboard());
+  pushDialogHistory(session, "assistant", warn);
+});
+
+bot.action(CALLBACK.PROFILE_EDIT_CONFIRM, async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(String(ctx.from.id));
+  // Новая ниша/цель меняют контекст тренировки — начинаем статистику заново.
+  session.selectedScenarioId = null;
+  session.attemptsInScenario = 0;
+  session.scenariosCompletedCount = 0;
+  session.totalAttemptsCount = 0;
+  session.scoreHistory = [];
+  session.bestScore = 0;
+  session.scenarioStats = {};
+  session.scenarioStatsByLevel = {
+    novice: {},
+    mid: {},
+    advanced: {},
+  };
+  session.aiScenario = null;
+
   session.profile.completed = false;
   session.profile.step = null;
   session.profile.niche = "";
   session.profile.goal = "";
-  await ctx.reply("Обновим профиль. Ответьте на 2 коротких вопроса.");
+  const editIntro =
+    "Обновим профиль. Прогресс сброшен, чтобы начать тренировки заново под новый контекст. Ответьте на 2 коротких вопроса.";
+  await ctx.reply(editIntro);
+  pushDialogHistory(session, "assistant", editIntro);
   await askProfileQuestion(ctx, session);
 });
 
 bot.action(CALLBACK.PROGRESS, async (ctx) => {
   await ctx.answerCbQuery();
   const session = getSession(String(ctx.from.id));
-  await ctx.reply(buildProgressText(session));
+  const progressText = buildProgressText(session);
+  await ctx.reply(progressText);
+  pushDialogHistory(session, "assistant", trimForHistory(progressText));
+});
+
+bot.action(CALLBACK.REPORT_BUG, async (ctx) => {
+  await ctx.answerCbQuery();
+  const session = getSession(String(ctx.from.id));
+  session.state = STATES.REPORT_INPUT;
+  const reportPrompt =
+    "Опишите проблему одним сообщением: что делали, что ожидали и что произошло. Я передам это в лог. Для отмены — /cancel.";
+  await ctx.reply(reportPrompt);
+  pushDialogHistory(session, "assistant", reportPrompt);
 });
 
 bot.action(CALLBACK.LEVEL, async (ctx) => {
   await ctx.answerCbQuery();
   const session = getSession(String(ctx.from.id));
   session.state = STATES.LEVEL_SELECT;
-  await ctx.reply("Выберите ваш уровень опыта:", levelKeyboard());
+  const levelPrompt = "Выберите ваш уровень опыта:";
+  await ctx.reply(levelPrompt, levelKeyboard());
+  pushDialogHistory(session, "assistant", levelPrompt);
 });
 
 bot.action(new RegExp(`^${CALLBACK.LEVEL_PREFIX}`), async (ctx) => {
@@ -312,13 +518,17 @@ bot.action(new RegExp(`^${CALLBACK.LEVEL_PREFIX}`), async (ctx) => {
   const session = getSession(String(ctx.from.id));
   const level = ctx.match.input.replace(CALLBACK.LEVEL_PREFIX, "");
   if (!EXPERIENCE_LEVELS[level]) {
-    await ctx.reply("Неизвестный уровень.");
+    const unk = "Неизвестный уровень.";
+    await ctx.reply(unk);
+    pushDialogHistory(session, "assistant", unk);
     return;
   }
 
   session.experienceLevel = level;
   session.state = STATES.MAIN_MENU;
-  await ctx.reply(`Уровень сохранен: ${EXPERIENCE_LEVELS[level]}.`);
+  const savedLevel = `Уровень сохранен: ${EXPERIENCE_LEVELS[level]}.`;
+  await ctx.reply(savedLevel);
+  pushDialogHistory(session, "assistant", savedLevel);
   await showMainMenu(ctx, session);
 });
 
@@ -328,31 +538,58 @@ bot.action(new RegExp(`^${CALLBACK.SCENARIO_PREFIX}`), async (ctx) => {
   const scenarioId = ctx.match.input.replace(CALLBACK.SCENARIO_PREFIX, "");
   const scenario = getScenarioById(scenarioId);
   if (!scenario) {
-    await ctx.reply("Сценарий не найден.");
+    const nf = "Сценарий не найден.";
+    await ctx.reply(nf);
+    pushDialogHistory(session, "assistant", nf);
     return;
   }
 
   session.selectedScenarioId = scenario.id;
   session.attemptsInScenario = 0;
   session.state = STATES.SCENARIO_INTRO;
+  session.aiScenario = null;
 
-  await ctx.reply(
-    `Сценарий: ${scenario.title}\n\n` +
-      `Ваш профиль:\n` +
-      `- Ниша: ${session.profile.niche}\n` +
-      `- Цель: ${session.profile.goal}\n\n` +
-      `Контекст ситуации:\n` +
-      `- Клиент: ${scenario.context.clientType}\n` +
-      `- Проект: ${scenario.context.project}\n` +
-      `- Этап: ${scenario.context.stage}\n` +
-      `- Напряжение: ${scenario.context.pressure}\n\n` +
-      `Челлендж уровня:\n- ${
-        scenario.levelChallenge[session.experienceLevel || "novice"]
-      }\n\n` +
-      `Сообщение клиента:\n"${scenario.clientMessage}"\n\n` +
-      `Цель: ${scenario.goal}\n\n` +
-      `Напишите ваш ответ одним сообщением.`
-  );
+  const level = getCurrentLevel(session);
+  await ctx.sendChatAction("typing");
+  if (isLlmEnabled()) {
+    await ctx.reply("Подбираю персональный сценарий под ваш профиль...");
+  }
+
+  let aiPayload = null;
+  if (isLlmEnabled()) {
+    try {
+      aiPayload = await generatePersonalizedScenario({
+        profile: session.profile,
+        level,
+        baseScenario: scenario,
+        dialogHistory: session.dialogHistory,
+      });
+    } catch (err) {
+      console.error("LLM scenario error:", err);
+    }
+  }
+
+  if (aiPayload && aiPayload.refusal) {
+    await ctx.reply(aiPayload.message);
+    pushDialogHistory(session, "assistant", aiPayload.message);
+    session.state = STATES.SCENARIO_SELECT;
+    const pick = `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите сценарий:`;
+    await ctx.reply(pick, scenariosKeyboard(session, level));
+    pushDialogHistory(session, "assistant", pick);
+    return;
+  }
+
+  if (aiPayload && !aiPayload.refusal) {
+    const enriched = enrichAiScenario(aiPayload, session, scenario);
+    session.aiScenario = enriched;
+    const intro = formatAiScenarioIntro(session, scenario, enriched);
+    await ctx.reply(intro);
+    pushDialogHistory(session, "assistant", trimForHistory(intro));
+  } else {
+    const introDb = formatDbScenarioIntro(session, scenario);
+    await ctx.reply(introDb);
+    pushDialogHistory(session, "assistant", trimForHistory(introDb));
+  }
   session.state = STATES.USER_RESPONSE_INPUT;
 });
 
@@ -361,16 +598,30 @@ bot.action(CALLBACK.RETRY, async (ctx) => {
   const session = getSession(String(ctx.from.id));
   const scenario = getScenarioById(session.selectedScenarioId);
   if (!scenario) {
-    await ctx.reply("Сначала выберите сценарий.");
+    const pickFirst = "Сначала выберите сценарий.";
+    await ctx.reply(pickFirst);
+    pushDialogHistory(session, "assistant", pickFirst);
     return;
   }
   session.state = STATES.USER_RESPONSE_INPUT;
-  await ctx.reply(
-    `Переигрываем "${scenario.title}".\n` +
+  if (session.aiScenario) {
+    const ai = session.aiScenario;
+    const retryText =
+      `Переигрываем "${ai.scenario_title}".\n` +
+      `Контекст: ${ai.context.project_hint}, ${ai.context.stage}.\n` +
+      `Сообщение клиента: "${ai.client_message}"\n\n` +
+      `Введите новый вариант ответа.`;
+    await ctx.reply(retryText);
+    pushDialogHistory(session, "assistant", retryText);
+  } else {
+    const retryText =
+      `Переигрываем "${scenario.title}".\n` +
       `Вспомните контекст: ${scenario.context.project}, ${scenario.context.stage}.\n` +
       `Сообщение клиента: "${scenario.clientMessage}"\n\n` +
-      `Введите новый вариант ответа.`
-  );
+      `Введите новый вариант ответа.`;
+    await ctx.reply(retryText);
+    pushDialogHistory(session, "assistant", retryText);
+  }
 });
 
 bot.action(CALLBACK.NEW_SCENARIO, async (ctx) => {
@@ -380,10 +631,9 @@ bot.action(CALLBACK.NEW_SCENARIO, async (ctx) => {
   session.selectedScenarioId = null;
   session.attemptsInScenario = 0;
   const level = getCurrentLevel(session);
-  await ctx.reply(
-    `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите новый сценарий:`,
-    scenariosKeyboard(session, level)
-  );
+  const newScText = `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите новый сценарий:`;
+  await ctx.reply(newScText, scenariosKeyboard(session, level));
+  pushDialogHistory(session, "assistant", newScText);
 });
 
 bot.on("text", async (ctx) => {
@@ -398,28 +648,110 @@ bot.on("text", async (ctx) => {
       return;
     }
     if (value.length < 2) {
-      await ctx.reply("Можно чуть подробнее, хотя бы 2-3 слова.");
+      pushDialogHistory(session, "user", value);
+      const shortHint = "Можно чуть подробнее, хотя бы 2-3 слова.";
+      await ctx.reply(shortHint);
+      pushDialogHistory(session, "assistant", shortHint);
       return;
     }
     session.profile[step] = value;
+    pushDialogHistory(session, "user", value);
     await askProfileQuestion(ctx, session);
     return;
   }
 
-  if (session.state !== STATES.USER_RESPONSE_INPUT) {
-    await ctx.reply(
-      "Сейчас не жду свободный текст. Выберите действие через кнопки.",
-      mainMenuKeyboard()
-    );
+  if (session.state === STATES.REPORT_INPUT) {
+    const reportText = ctx.message.text.trim();
+    pushDialogHistory(session, "user", reportText);
+    if (!reportText) return;
+
+    if (isLlmEnabled()) {
+      await ctx.sendChatAction("typing");
+      const reportCheck = await evaluateBugReport(reportText);
+      if (reportCheck && reportCheck.accept === false) {
+        const reject =
+          reportCheck.message ||
+          "Похоже, это не похоже на баг-репорт. Опишите коротко, что не сработало.";
+        await ctx.reply(reject);
+        pushDialogHistory(session, "assistant", reject);
+        return;
+      }
+    }
+
+    console.warn("[BUG_REPORT]", {
+      userId,
+      username: ctx.from?.username || null,
+      firstName: ctx.from?.first_name || null,
+      report: reportText,
+      at: new Date().toISOString(),
+    });
+
+    session.state = STATES.MAIN_MENU;
+    const thanks =
+      "Спасибо! Сообщение о проблеме записано. Возвращаю вас в меню.";
+    await ctx.reply(thanks);
+    pushDialogHistory(session, "assistant", thanks);
+    await showMainMenu(ctx, session);
     return;
   }
 
+  if (session.state !== STATES.USER_RESPONSE_INPUT) {
+    const stray = ctx.message.text.trim();
+    if (stray) pushDialogHistory(session, "user", stray);
+    const notWaiting =
+      "Сейчас не жду свободный текст. Выберите действие через кнопки.";
+    await ctx.reply(notWaiting, mainMenuKeyboard());
+    pushDialogHistory(session, "assistant", notWaiting);
+    return;
+  }
+
+  const userText = ctx.message.text.trim();
+
   const scenario = getScenarioById(session.selectedScenarioId);
   if (!scenario) {
-    await ctx.reply("Сценарий потерян. Выберите его заново.");
+    if (userText) pushDialogHistory(session, "user", userText);
+    const lost = "Сценарий потерян. Выберите его заново.";
+    await ctx.reply(lost);
+    pushDialogHistory(session, "assistant", lost);
     session.state = STATES.SCENARIO_SELECT;
     const level = getCurrentLevel(session);
-    await ctx.reply("Доступные сценарии:", scenariosKeyboard(session, level));
+    const listHint = "Доступные сценарии:";
+    await ctx.reply(listHint, scenariosKeyboard(session, level));
+    pushDialogHistory(session, "assistant", listHint);
+    return;
+  }
+  const level = session.experienceLevel || "novice";
+  const scenarioTitle = session.aiScenario?.scenario_title || scenario.title;
+  const clientMessage = session.aiScenario?.client_message || scenario.clientMessage;
+  const trainerGoal = session.aiScenario?.trainer_goal || scenario.goal;
+
+  await ctx.sendChatAction("typing");
+  if (isLlmEnabled()) {
+    await ctx.reply("Анализирую ваш ответ и готовлю персональный фидбек...");
+  }
+
+  let llmFeedback = null;
+  if (isLlmEnabled()) {
+    try {
+      llmFeedback = await generateFeedback({
+        profile: session.profile,
+        level,
+        scenarioTitle,
+        clientMessage,
+        trainerGoal,
+        userAnswer: userText,
+        dialogHistory: session.dialogHistory,
+      });
+    } catch (err) {
+      console.error("LLM feedback error:", err);
+    }
+  }
+
+  if (llmFeedback && llmFeedback.refusal) {
+    pushDialogHistory(session, "user", userText);
+    const refuseMsg = `${llmFeedback.message}\n\nПопробуйте ответить на сообщение клиента из сценария.`;
+    await ctx.reply(refuseMsg);
+    pushDialogHistory(session, "assistant", refuseMsg);
     return;
   }
 
@@ -427,24 +759,42 @@ bot.on("text", async (ctx) => {
   session.attemptsInScenario += 1;
   session.totalAttemptsCount += 1;
 
-  const userText = ctx.message.text.trim();
-  const level = session.experienceLevel || "novice";
-  const scoreResult = scoreResponse(userText, level, EVALUATION_RULES);
-  const shortFeedback = buildShortFeedback(scoreResult, level);
-  const improvedVersion = buildImprovedVersion(
+  const heuristic = scoreResponse(userText, level, EVALUATION_RULES);
+  let scoreForStats = heuristic.score;
+  let shortFeedback = buildShortFeedback(heuristic, level);
+  let improvedVersion = buildImprovedVersion(
     userText,
     scenario,
     level,
     session.profile
   );
-  const templateExample =
-    scenario.goodTemplates[session.attemptsInScenario % scenario.goodTemplates.length];
+  let hintLines =
+    heuristic.hints.length > 0
+      ? heuristic.hints
+      : ["Ответ сильный, можно тестировать на реальном диалоге."];
+
+  if (llmFeedback && !llmFeedback.refusal) {
+    scoreForStats = llmFeedback.score;
+    shortFeedback = `${llmFeedback.short_feedback}\nОценка: ${llmFeedback.score}/5`;
+    improvedVersion = llmFeedback.improved_version;
+    hintLines =
+      llmFeedback.hints.length > 0 ? llmFeedback.hints : heuristic.hints;
+  }
+
+  let templateExample = buildPersonalizedGoodExampleFallback(
+    scenario,
+    session.attemptsInScenario,
+    session.profile
+  );
+  if (llmFeedback && !llmFeedback.refusal && llmFeedback.good_example) {
+    templateExample = llmFeedback.good_example;
+  }
   const previousScore =
     session.scoreHistory.length > 0
       ? session.scoreHistory[session.scoreHistory.length - 1]
       : null;
   const delta =
-    previousScore === null ? 0 : scoreResult.score - previousScore;
+    previousScore === null ? 0 : scoreForStats - previousScore;
   const deltaText =
     previousScore === null
       ? "первая оценка"
@@ -454,12 +804,12 @@ bot.on("text", async (ctx) => {
       ? `${delta} к прошлой попытке`
       : "без изменений к прошлой попытке";
 
-  session.scoreHistory.push(scoreResult.score);
+  session.scoreHistory.push(scoreForStats);
   if (session.scoreHistory.length > 20) {
     session.scoreHistory = session.scoreHistory.slice(-20);
   }
-  if (scoreResult.score > session.bestScore) {
-    session.bestScore = scoreResult.score;
+  if (scoreForStats > session.bestScore) {
+    session.bestScore = scoreForStats;
   }
   const levelStats = getScenarioStatsForLevel(session, level);
   if (!levelStats[scenario.id]) {
@@ -471,26 +821,27 @@ bot.on("text", async (ctx) => {
     };
   }
   levelStats[scenario.id].attempts += 1;
-  levelStats[scenario.id].totalScore += scoreResult.score;
-  levelStats[scenario.id].lastScore = scoreResult.score;
-  if (scoreResult.score > levelStats[scenario.id].bestScore) {
-    levelStats[scenario.id].bestScore = scoreResult.score;
+  levelStats[scenario.id].totalScore += scoreForStats;
+  levelStats[scenario.id].lastScore = scoreForStats;
+  if (scoreForStats > levelStats[scenario.id].bestScore) {
+    levelStats[scenario.id].bestScore = scoreForStats;
   }
 
   session.state = STATES.RESULT_VIEW;
   session.scenariosCompletedCount += 1;
 
-  await ctx.reply(
+  pushDialogHistory(session, "user", userText);
+  const feedbackText =
     `Фидбек:\n${shortFeedback}\n\n` +
-      `Что улучшить:\n- ${scoreResult.hints.join("\n- ") || "Ответ сильный, можно тестировать на реальном диалоге."}\n\n` +
-      `Динамика:\n` +
-      `- Оценка: ${scoreResult.score}/5 (${renderScoreBar(scoreResult.score, 5)})\n` +
-      `- Изменение: ${deltaText}\n` +
-      `- Тренд: ${calcTrendLabel(session.scoreHistory)}\n\n` +
-      `Улучшенная версия:\n${improvedVersion}\n\n` +
-      `Пример хорошего ответа:\n${templateExample}`,
-    resultKeyboard()
-  );
+    `Что улучшить:\n- ${hintLines.join("\n- ")}\n\n` +
+    `Динамика:\n` +
+    `- Оценка: ${scoreForStats}/5 (${renderScoreBar(scoreForStats, 5)})\n` +
+    `- Изменение: ${deltaText}\n` +
+    `- Тренд: ${calcTrendLabel(session.scoreHistory)}\n\n` +
+    `Улучшенная версия:\n${improvedVersion}\n\n` +
+    `Пример хорошего ответа:\n${templateExample}`;
+  await ctx.reply(feedbackText, resultKeyboard());
+  pushDialogHistory(session, "assistant", trimForHistory(feedbackText));
 });
 
 bot.catch((err) => {
@@ -513,10 +864,21 @@ async function initAndLaunch() {
   console.log("Bot is running...");
 }
 
-initAndLaunch().catch((err) => {
-  console.error("Failed to start bot:", err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== "test") {
+  initAndLaunch().catch((err) => {
+    const code = err?.response?.error_code;
+    if (code === 409) {
+      console.error(
+        "Failed to start bot: 409 Conflict — уже кто-то вызывает getUpdates с этим BOT_TOKEN.\n" +
+          "Остановите второй экземпляр бота: другой терминал (npm start / npm run dev), деплой на сервере, второй ПК.\n" +
+          "Если настроен webhook на этот бот — удалите webhook или не используйте polling одновременно."
+      );
+    } else {
+      console.error("Failed to start bot:", err);
+    }
+    process.exit(1);
+  });
+}
 
 let isPoolClosed = false;
 async function closePoolOnce() {
@@ -536,11 +898,25 @@ function stopBotSafe(signal) {
   }
 }
 
-process.once("SIGINT", async () => {
-  stopBotSafe("SIGINT");
-  await closePoolOnce();
-});
-process.once("SIGTERM", async () => {
-  stopBotSafe("SIGTERM");
-  await closePoolOnce();
-});
+if (process.env.NODE_ENV !== "test") {
+  process.once("SIGINT", async () => {
+    stopBotSafe("SIGINT");
+    await closePoolOnce();
+  });
+  process.once("SIGTERM", async () => {
+    stopBotSafe("SIGTERM");
+    await closePoolOnce();
+  });
+}
+
+function __setTestData({ scenarios = [], evaluationRules = [] } = {}) {
+  SCENARIOS = scenarios;
+  EVALUATION_RULES = evaluationRules;
+}
+
+module.exports = {
+  bot,
+  __setTestData,
+  getSession,
+  STATES,
+};

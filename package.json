@@ -8,7 +8,10 @@
     "dev": "node --watch src/index.js",
     "db:init": "node scripts/db-init.js",
     "db:seed": "node scripts/db-seed.js",
-    "test": "echo \"No tests yet\""
+    "test": "node --test",
+    "test:unit": "node --test",
+    "test:prompts": "node scripts/llm-prompt-smoke.js",
+    "test:live:personalization": "node scripts/llm-personalization-live.js"
   },
   "keywords": [],
   "author": "",
@@ -16,6 +19,7 @@
   "type": "commonjs",
   "dependencies": {
     "dotenv": "^17.4.1",
+    "openai": "^6.33.0",
     "pg": "^8.20.0",
     "telegraf": "^4.16.3"
   }

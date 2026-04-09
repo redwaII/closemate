@@ -134,6 +134,24 @@ function buildImprovedVersion(userText, scenario, level, profile = null) {
   ].join(" ");
 }
 
+/**
+ * Если LLM недоступен — к шаблону из каталога добавляем явную привязку к профилю.
+ */
+function buildPersonalizedGoodExampleFallback(scenario, attemptsInScenario, profile) {
+  const templates = scenario?.goodTemplates || [];
+  const base =
+    templates.length > 0
+      ? templates[attemptsInScenario % templates.length]
+      : "Коротко признайте запрос клиента, зафиксируйте ценность и предложите один ясный следующий шаг.";
+  const niche = profile?.niche?.trim();
+  const goal = profile?.goal?.trim();
+  if (!niche && !goal) return base;
+  const parts = [];
+  if (niche) parts.push(`ниша «${niche}»`);
+  if (goal) parts.push(`цель «${goal}»`);
+  return `С учётом вашего профиля (${parts.join(", ")}), сильная реплика в таком диалоге часто сочетает эмпатию, ценность и конкретный шаг. Опорная формулировка:\n${base}`;
+}
+
 function buildShortFeedback(scoreResult, level) {
   let style = "Неплохой деловой ответ.";
   if (level === "novice") {
@@ -154,5 +172,6 @@ function buildShortFeedback(scoreResult, level) {
 module.exports = {
   scoreResponse,
   buildImprovedVersion,
+  buildPersonalizedGoodExampleFallback,
   buildShortFeedback,
 };
