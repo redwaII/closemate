@@ -15,6 +15,15 @@ const {
   pushDialogHistory,
 } = require("./state");
 const { ensureBusinessSchema, getBusinessData } = require("./businessDataRepo");
+const {
+  PLAN_FREE,
+  PLAN_PRO,
+  ensureAccessSchema,
+  getOrCreateUserAccess,
+  getUserAccess,
+  userExists,
+  setUserPlan,
+} = require("./accessRepo");
 const { pool } = require("./db");
 const {
   isLlmEnabled,
@@ -28,6 +37,14 @@ const EXPERIENCE_LEVELS = {
   mid: "Средний",
   advanced: "Продвинутый",
 };
+const FREE_SCENARIO_IDS = new Set(["expensive", "think"]);
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "@nnixaiI";
+const ADMIN_IDS = new Set(
+  String(process.env.ADMIN_IDS || "8031970727")
+    .split(",")
+    .map((x) => x.trim())
+    .filter(Boolean)
+);
 
 let SCENARIOS = [];
 let EVALUATION_RULES = [];
@@ -43,6 +60,7 @@ const bot = new Telegraf(botToken);
 const CALLBACK = {
   TRAIN: "menu:train",
   PROGRESS: "menu:progress",
+  PLAN_STATUS: "menu:plan_status",
   LEVEL: "menu:level",
   REPORT_BUG: "menu:report_bug",
   BACK_MENU: "menu:back",
@@ -53,6 +71,8 @@ const CALLBACK = {
   PROFILE_START: "profile:start",
   PROFILE_EDIT: "profile:edit",
   PROFILE_EDIT_CONFIRM: "profile:edit:confirm",
+  OPEN_PRO: "paywall:open_pro",
+  OPEN_PRO_DETAILS: "paywall:details",
 };
 
 const PROFILE_STEPS = ["niche", "goal"];
@@ -80,14 +100,61 @@ function trimForHistory(text, maxLen = 1800) {
   return `${t.slice(0, maxLen)}…`;
 }
 
-function mainMenuKeyboard() {
+function isProPlan(session) {
+  return session.plan === PLAN_PRO;
+}
+
+function isScenarioLockedForPlan(scenarioId, session) {
+  if (isProPlan(session)) return false;
+  return !FREE_SCENARIO_IDS.has(scenarioId);
+}
+
+async function syncSessionPlan(session, userId) {
+  const access = await getOrCreateUserAccess(userId);
+  session.plan = access.plan;
+  return access.plan;
+}
+
+function proValueBullets() {
+  return (
+    `- все 6 сценариев с разными уровнями сложности\n` +
+    `- сложные переговоры\n` +
+    `- персонализированные диалоги\n` +
+    `- тренировку, максимально близкую к реальным клиентам\n` +
+    `- подробный анализ ваших ответов и рекомендации по улучшению`
+  );
+}
+
+function buildPaywallText() {
+  return (
+    `Полная версия Closemate PRO 🔓\n` +
+    `299 ₽ — разовая оплата, доступ ко всем сценариям.\n\n` +
+    `Что входит:\n${proValueBullets()}\n\n` +
+    `Для активации напишите админу: ${ADMIN_USERNAME}`
+  );
+}
+
+function paywallKeyboard() {
   return Markup.inlineKeyboard([
+    [Markup.button.callback("Открыть PRO 🔓", CALLBACK.OPEN_PRO)],
+    [Markup.button.callback("Что входит в PRO", CALLBACK.OPEN_PRO_DETAILS)],
+    [Markup.button.callback("В меню", CALLBACK.BACK_MENU)],
+  ]);
+}
+
+function mainMenuKeyboard(session) {
+  const rows = [
     [Markup.button.callback("Выбрать сценарий", CALLBACK.TRAIN)],
     [Markup.button.callback("Мой прогресс", CALLBACK.PROGRESS)],
+    [Markup.button.callback("Мой тариф", CALLBACK.PLAN_STATUS)],
     [Markup.button.callback("Настройки уровня", CALLBACK.LEVEL)],
     [Markup.button.callback("Изменить профиль", CALLBACK.PROFILE_EDIT)],
     [Markup.button.callback("Сообщить о проблеме", CALLBACK.REPORT_BUG)],
-  ]);
+  ];
+  if (!isProPlan(session)) {
+    rows.splice(2, 0, [Markup.button.callback("Открыть PRO 🔓", CALLBACK.OPEN_PRO)]);
+  }
+  return Markup.inlineKeyboard(rows);
 }
 
 function profileStartKeyboard() {
@@ -153,7 +220,9 @@ function scenariosKeyboard(session, level) {
   const levelStats = getScenarioStatsForLevel(session, level);
   const rows = SCENARIOS.map((scenario) => [
     Markup.button.callback(
-      `${scenario.title}  ${getScenarioBadge(levelStats[scenario.id])}`,
+      `${scenario.title}${isScenarioLockedForPlan(scenario.id, session) ? " 🔒 PRO" : ""}  ${
+        getScenarioBadge(levelStats[scenario.id])
+      }`,
       `${CALLBACK.SCENARIO_PREFIX}${scenario.id}`
     ),
   ]);
@@ -337,16 +406,34 @@ function buildProgressText(session) {
 
 async function showMainMenu(ctx, session) {
   session.state = STATES.MAIN_MENU;
-  const levelLabel = session.experienceLevel
-    ? EXPERIENCE_LEVELS[session.experienceLevel]
-    : "не выбран";
-  const text = `Тренажер продаж для фрилансеров.\nУровень: ${levelLabel}\n\nВыберите действие:`;
-  await ctx.reply(text, mainMenuKeyboard());
+  const levelLabel = isProPlan(session)
+    ? session.experienceLevel
+      ? EXPERIENCE_LEVELS[session.experienceLevel]
+      : "не выбран"
+    : EXPERIENCE_LEVELS.novice;
+  const planLabel = isProPlan(session) ? "PRO" : "Free";
+  const freeHint = isProPlan(session)
+    ? ""
+    : `\n\nFree-режим:\n- 2 активных сценария (остальные 🔒 PRO)\n- только уровень Новичок\n- короткий разбор ответа\n- расширенная персонализация 🔒`;
+  const text =
+    `Тренажер продаж для фрилансеров.\nТариф: ${planLabel}\nУровень: ${levelLabel}` +
+    `${freeHint}\n\nВыберите действие:`;
+  await ctx.reply(text, mainMenuKeyboard(session));
   pushDialogHistory(session, "assistant", text);
 }
 
 function getNextProfileStep(profile) {
   return PROFILE_STEPS.find((step) => !profile[step]) || null;
+}
+
+function isAdminUser(ctx) {
+  return ADMIN_IDS.has(String(ctx.from?.id || ""));
+}
+
+function parseCommandArgUserId(ctx) {
+  const text = ctx.message?.text || "";
+  const parts = text.trim().split(/\s+/);
+  return parts[1] ? String(parts[1]).trim() : "";
 }
 
 async function askProfileQuestion(ctx, session) {
@@ -373,6 +460,7 @@ async function askProfileQuestion(ctx, session) {
 bot.start(async (ctx) => {
   const userId = String(ctx.from.id);
   const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   resetToMainMenu(userId);
   session.dialogHistory = [];
 
@@ -380,12 +468,11 @@ bot.start(async (ctx) => {
   await ctx.reply(greet);
   pushDialogHistory(session, "assistant", greet);
 
-  if (!session.profile.completed) {
+  if (isProPlan(session) && !session.profile.completed) {
     const t =
-      "Перед первой тренировкой давайте быстро соберем профиль, чтобы сделать сценарии под вас.";
-    await ctx.reply(t, profileStartKeyboard());
+      "Для более точной персонализации в PRO можно заполнить профиль (2 вопроса) в меню «Изменить профиль».";
+    await ctx.reply(t);
     pushDialogHistory(session, "assistant", t);
-    return;
   }
   await showMainMenu(ctx, session);
 });
@@ -395,14 +482,19 @@ bot.command("reset", async (ctx) => {
   await ctx.sendChatAction("typing");
   resetSession(userId);
   const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   const msg =
     "Готово: профиль, прогресс и история диалога сброшены. Начинаем заново.";
   await ctx.reply(msg);
   pushDialogHistory(session, "assistant", msg);
-  const hint =
-    "Заполните профиль двумя короткими ответами — так сценарии будут персональнее.";
-  await ctx.reply(hint, profileStartKeyboard());
-  pushDialogHistory(session, "assistant", hint);
+  if (isProPlan(session)) {
+    const hint =
+      "Заполните профиль двумя короткими ответами — так сценарии будут персональнее.";
+    await ctx.reply(hint, profileStartKeyboard());
+    pushDialogHistory(session, "assistant", hint);
+  } else {
+    await showMainMenu(ctx, session);
+  }
 });
 
 bot.command("cancel", async (ctx) => {
@@ -414,43 +506,135 @@ bot.command("cancel", async (ctx) => {
   await showMainMenu(ctx, session);
 });
 
+bot.command("grant_pro", async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const targetId = parseCommandArgUserId(ctx);
+  if (!targetId) {
+    await ctx.reply("Использование: /grant_pro <user_id>");
+    return;
+  }
+  if (!(await userExists(targetId))) {
+    await ctx.reply(`Пользователь ${targetId} не найден. Он должен хотя бы раз открыть бота.`);
+    return;
+  }
+  const updated = await setUserPlan({
+    userId: targetId,
+    plan: PLAN_PRO,
+    adminId: String(ctx.from.id),
+    source: "manual",
+    planType: "one_time",
+    isActive: true,
+  });
+  console.log("[ACCESS_CHANGE]", {
+    by: String(ctx.from.id),
+    targetId,
+    plan: updated.plan,
+    source: updated.source,
+    at: new Date().toISOString(),
+  });
+  await ctx.reply(`Готово: пользователю ${targetId} выдан PRO.`);
+});
+
+bot.command("revoke_pro", async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const targetId = parseCommandArgUserId(ctx);
+  if (!targetId) {
+    await ctx.reply("Использование: /revoke_pro <user_id>");
+    return;
+  }
+  if (!(await userExists(targetId))) {
+    await ctx.reply(`Пользователь ${targetId} не найден.`);
+    return;
+  }
+  const updated = await setUserPlan({
+    userId: targetId,
+    plan: PLAN_FREE,
+    adminId: String(ctx.from.id),
+    source: "manual",
+    planType: "one_time",
+    isActive: true,
+  });
+  console.log("[ACCESS_CHANGE]", {
+    by: String(ctx.from.id),
+    targetId,
+    plan: updated.plan,
+    source: updated.source,
+    at: new Date().toISOString(),
+  });
+  await ctx.reply(`Готово: пользователю ${targetId} возвращен FREE.`);
+});
+
+bot.command("plan", async (ctx) => {
+  if (!isAdminUser(ctx)) return;
+  const targetId = parseCommandArgUserId(ctx);
+  if (!targetId) {
+    await ctx.reply("Использование: /plan <user_id>");
+    return;
+  }
+  const access = await getUserAccess(targetId);
+  await ctx.reply(
+    `План пользователя ${targetId}:\n` +
+      `- plan: ${access.plan}\n` +
+      `- type: ${access.planType}\n` +
+      `- source: ${access.source}\n` +
+      `- active: ${access.isActive ? "yes" : "no"}\n` +
+      `- expires_at: ${access.expiresAt || "null"}`
+  );
+});
+
 bot.action(CALLBACK.BACK_MENU, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
-  resetToMainMenu(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  resetToMainMenu(userId);
   await showMainMenu(ctx, session);
 });
 
 bot.action(CALLBACK.TRAIN, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
-  if (!session.profile.completed) {
-    const needProfile =
-      "Сначала заполните короткий профиль, чтобы сценарии были адаптированы под вашу ситуацию.";
-    await ctx.reply(needProfile, profileStartKeyboard());
-    pushDialogHistory(session, "assistant", needProfile);
-    return;
-  }
-  const level = getCurrentLevel(session);
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  const level = isProPlan(session) ? getCurrentLevel(session) : "novice";
   session.state = STATES.SCENARIO_SELECT;
+  if (!isProPlan(session)) session.experienceLevel = "novice";
   const trainIntro =
-    `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите тип возражения для тренировки.\n${getWeakScenariosHint(
-      session,
-      level
-    )}`;
+    `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите тип возражения для тренировки.\n${getWeakScenariosHint(session, level)}`;
   await ctx.reply(trainIntro, scenariosKeyboard(session, level));
   pushDialogHistory(session, "assistant", trainIntro);
 });
 
 bot.action(CALLBACK.PROFILE_START, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  if (!isProPlan(session)) {
+    const t =
+      `Базовая версия использует шаблонные диалоги. Расширенная персонализация профиля доступна в PRO 🔒\n` +
+      `Для активации напишите админу: ${ADMIN_USERNAME}`;
+    await ctx.reply(t, paywallKeyboard());
+    pushDialogHistory(session, "assistant", t);
+    return;
+  }
   await askProfileQuestion(ctx, session);
 });
 
 bot.action(CALLBACK.PROFILE_EDIT, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  if (!isProPlan(session)) {
+    const t =
+      `Расширенная персонализация 🔒 доступна только в PRO.\n` +
+      `В Free вы можете тренироваться на шаблонных диалогах.\n` +
+      `Для активации напишите админу: ${ADMIN_USERNAME}`;
+    await ctx.reply(t, paywallKeyboard());
+    pushDialogHistory(session, "assistant", t);
+    return;
+  }
   const warn =
     "Внимание: при изменении профиля текущий прогресс прохождения будет сброшен, и тренировка начнется заново. Продолжить?";
   await ctx.reply(warn, profileEditConfirmKeyboard());
@@ -459,7 +643,15 @@ bot.action(CALLBACK.PROFILE_EDIT, async (ctx) => {
 
 bot.action(CALLBACK.PROFILE_EDIT_CONFIRM, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  if (!isProPlan(session)) {
+    const t = `Эта функция доступна в PRO. Напишите админу: ${ADMIN_USERNAME}`;
+    await ctx.reply(t, paywallKeyboard());
+    pushDialogHistory(session, "assistant", t);
+    return;
+  }
   // Новая ниша/цель меняют контекст тренировки — начинаем статистику заново.
   session.selectedScenarioId = null;
   session.attemptsInScenario = 0;
@@ -488,15 +680,32 @@ bot.action(CALLBACK.PROFILE_EDIT_CONFIRM, async (ctx) => {
 
 bot.action(CALLBACK.PROGRESS, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   const progressText = buildProgressText(session);
   await ctx.reply(progressText);
   pushDialogHistory(session, "assistant", trimForHistory(progressText));
 });
 
+bot.action(CALLBACK.PLAN_STATUS, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  const isPro = isProPlan(session);
+  const text = isPro
+    ? `Ваш тариф: PRO 🔓\n\nДоступны все сценарии, уровни и расширенная персонализация.`
+    : `Ваш тариф: Free\n\nДоступны 2 сценария и уровень "Новичок".\nPRO (299 ₽, разово) открывает все сценарии и расширенный разбор.`;
+  await ctx.reply(text, isPro ? mainMenuKeyboard(session) : paywallKeyboard());
+  pushDialogHistory(session, "assistant", text);
+});
+
 bot.action(CALLBACK.REPORT_BUG, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   session.state = STATES.REPORT_INPUT;
   const reportPrompt =
     "Опишите проблему одним сообщением: что делали, что ожидали и что произошло. Я передам это в лог. Для отмены — /cancel.";
@@ -504,9 +713,48 @@ bot.action(CALLBACK.REPORT_BUG, async (ctx) => {
   pushDialogHistory(session, "assistant", reportPrompt);
 });
 
+bot.action(CALLBACK.OPEN_PRO, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  if (isProPlan(session)) {
+    const t = "У вас уже активирован PRO 🎉";
+    await ctx.reply(t);
+    pushDialogHistory(session, "assistant", t);
+    return;
+  }
+  const text = buildPaywallText();
+  await ctx.reply(text, paywallKeyboard());
+  pushDialogHistory(session, "assistant", text);
+});
+
+bot.action(CALLBACK.OPEN_PRO_DETAILS, async (ctx) => {
+  await ctx.answerCbQuery();
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  const details =
+    `Что дает PRO за 299 ₽ (разово):\n${proValueBullets()}\n\n` +
+    `Для активации напишите админу: ${ADMIN_USERNAME}`;
+  await ctx.reply(details, paywallKeyboard());
+  pushDialogHistory(session, "assistant", details);
+});
+
 bot.action(CALLBACK.LEVEL, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  if (!isProPlan(session)) {
+    const lockText =
+      `В бесплатной версии доступен только уровень "${EXPERIENCE_LEVELS.novice}".\n` +
+      `Остальные уровни доступны в PRO за 299 ₽.\n` +
+      `Для активации напишите админу: ${ADMIN_USERNAME}`;
+    await ctx.reply(lockText, paywallKeyboard());
+    pushDialogHistory(session, "assistant", lockText);
+    return;
+  }
   session.state = STATES.LEVEL_SELECT;
   const levelPrompt = "Выберите ваш уровень опыта:";
   await ctx.reply(levelPrompt, levelKeyboard());
@@ -515,7 +763,15 @@ bot.action(CALLBACK.LEVEL, async (ctx) => {
 
 bot.action(new RegExp(`^${CALLBACK.LEVEL_PREFIX}`), async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
+  if (!isProPlan(session)) {
+    const t = `Этот уровень доступен в полной версии 🔓\n299 ₽ — доступ ко всем сценариям.\nДля активации: ${ADMIN_USERNAME}`;
+    await ctx.reply(t, paywallKeyboard());
+    pushDialogHistory(session, "assistant", t);
+    return;
+  }
   const level = ctx.match.input.replace(CALLBACK.LEVEL_PREFIX, "");
   if (!EXPERIENCE_LEVELS[level]) {
     const unk = "Неизвестный уровень.";
@@ -534,7 +790,9 @@ bot.action(new RegExp(`^${CALLBACK.LEVEL_PREFIX}`), async (ctx) => {
 
 bot.action(new RegExp(`^${CALLBACK.SCENARIO_PREFIX}`), async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   const scenarioId = ctx.match.input.replace(CALLBACK.SCENARIO_PREFIX, "");
   const scenario = getScenarioById(scenarioId);
   if (!scenario) {
@@ -543,20 +801,30 @@ bot.action(new RegExp(`^${CALLBACK.SCENARIO_PREFIX}`), async (ctx) => {
     pushDialogHistory(session, "assistant", nf);
     return;
   }
+  if (isScenarioLockedForPlan(scenario.id, session)) {
+    const lock =
+      `Этот сценарий доступен в полной версии 🔓\n` +
+      `299 ₽ — доступ ко всем сценариям и уровням.\n` +
+      `Для активации напишите админу: ${ADMIN_USERNAME}`;
+    await ctx.reply(lock, paywallKeyboard());
+    pushDialogHistory(session, "assistant", lock);
+    return;
+  }
 
   session.selectedScenarioId = scenario.id;
   session.attemptsInScenario = 0;
   session.state = STATES.SCENARIO_INTRO;
   session.aiScenario = null;
 
-  const level = getCurrentLevel(session);
+  const level = isProPlan(session) ? getCurrentLevel(session) : "novice";
+  if (!isProPlan(session)) session.experienceLevel = "novice";
   await ctx.sendChatAction("typing");
-  if (isLlmEnabled()) {
+  if (isProPlan(session) && isLlmEnabled()) {
     await ctx.reply("Подбираю персональный сценарий под ваш профиль...");
   }
 
   let aiPayload = null;
-  if (isLlmEnabled()) {
+  if (isProPlan(session) && isLlmEnabled()) {
     try {
       aiPayload = await generatePersonalizedScenario({
         profile: session.profile,
@@ -595,7 +863,9 @@ bot.action(new RegExp(`^${CALLBACK.SCENARIO_PREFIX}`), async (ctx) => {
 
 bot.action(CALLBACK.RETRY, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   const scenario = getScenarioById(session.selectedScenarioId);
   if (!scenario) {
     const pickFirst = "Сначала выберите сценарий.";
@@ -626,11 +896,14 @@ bot.action(CALLBACK.RETRY, async (ctx) => {
 
 bot.action(CALLBACK.NEW_SCENARIO, async (ctx) => {
   await ctx.answerCbQuery();
-  const session = getSession(String(ctx.from.id));
+  const userId = String(ctx.from.id);
+  const session = getSession(userId);
+  await syncSessionPlan(session, userId);
   session.state = STATES.SCENARIO_SELECT;
   session.selectedScenarioId = null;
   session.attemptsInScenario = 0;
-  const level = getCurrentLevel(session);
+  const level = isProPlan(session) ? getCurrentLevel(session) : "novice";
+  if (!isProPlan(session)) session.experienceLevel = "novice";
   const newScText = `Уровень: ${EXPERIENCE_LEVELS[level]}\nВыберите новый сценарий:`;
   await ctx.reply(newScText, scenariosKeyboard(session, level));
   pushDialogHistory(session, "assistant", newScText);
@@ -665,17 +938,15 @@ bot.on("text", async (ctx) => {
     pushDialogHistory(session, "user", reportText);
     if (!reportText) return;
 
-    if (isLlmEnabled()) {
-      await ctx.sendChatAction("typing");
-      const reportCheck = await evaluateBugReport(reportText);
-      if (reportCheck && reportCheck.accept === false) {
-        const reject =
-          reportCheck.message ||
-          "Похоже, это не похоже на баг-репорт. Опишите коротко, что не сработало.";
-        await ctx.reply(reject);
-        pushDialogHistory(session, "assistant", reject);
-        return;
-      }
+    if (isLlmEnabled()) await ctx.sendChatAction("typing");
+    const reportCheck = await evaluateBugReport(reportText);
+    if (reportCheck && reportCheck.accept === false) {
+      const reject =
+        reportCheck.message ||
+        "Похоже, это не похоже на баг-репорт. Опишите коротко, что не сработало.";
+      await ctx.reply(reject);
+      pushDialogHistory(session, "assistant", reject);
+      return;
     }
 
     console.warn("[BUG_REPORT]", {
@@ -700,12 +971,13 @@ bot.on("text", async (ctx) => {
     if (stray) pushDialogHistory(session, "user", stray);
     const notWaiting =
       "Сейчас не жду свободный текст. Выберите действие через кнопки.";
-    await ctx.reply(notWaiting, mainMenuKeyboard());
+    await ctx.reply(notWaiting, mainMenuKeyboard(session));
     pushDialogHistory(session, "assistant", notWaiting);
     return;
   }
 
   const userText = ctx.message.text.trim();
+  await syncSessionPlan(session, userId);
 
   const scenario = getScenarioById(session.selectedScenarioId);
   if (!scenario) {
@@ -720,18 +992,19 @@ bot.on("text", async (ctx) => {
     pushDialogHistory(session, "assistant", listHint);
     return;
   }
-  const level = session.experienceLevel || "novice";
+  const level = isProPlan(session) ? session.experienceLevel || "novice" : "novice";
+  if (!isProPlan(session)) session.experienceLevel = "novice";
   const scenarioTitle = session.aiScenario?.scenario_title || scenario.title;
   const clientMessage = session.aiScenario?.client_message || scenario.clientMessage;
   const trainerGoal = session.aiScenario?.trainer_goal || scenario.goal;
 
   await ctx.sendChatAction("typing");
-  if (isLlmEnabled()) {
+  if (isProPlan(session) && isLlmEnabled()) {
     await ctx.reply("Анализирую ваш ответ и готовлю персональный фидбек...");
   }
 
   let llmFeedback = null;
-  if (isLlmEnabled()) {
+  if (isProPlan(session) && isLlmEnabled()) {
     try {
       llmFeedback = await generateFeedback({
         profile: session.profile,
@@ -831,17 +1104,31 @@ bot.on("text", async (ctx) => {
   session.scenariosCompletedCount += 1;
 
   pushDialogHistory(session, "user", userText);
-  const feedbackText =
-    `Фидбек:\n${shortFeedback}\n\n` +
-    `Что улучшить:\n- ${hintLines.join("\n- ")}\n\n` +
-    `Динамика:\n` +
-    `- Оценка: ${scoreForStats}/5 (${renderScoreBar(scoreForStats, 5)})\n` +
-    `- Изменение: ${deltaText}\n` +
-    `- Тренд: ${calcTrendLabel(session.scoreHistory)}\n\n` +
-    `Улучшенная версия:\n${improvedVersion}\n\n` +
-    `Пример хорошего ответа:\n${templateExample}`;
+  const feedbackText = isProPlan(session)
+    ? `Фидбек:\n${shortFeedback}\n\n` +
+      `Что улучшить:\n- ${hintLines.join("\n- ")}\n\n` +
+      `Динамика:\n` +
+      `- Оценка: ${scoreForStats}/5 (${renderScoreBar(scoreForStats, 5)})\n` +
+      `- Изменение: ${deltaText}\n` +
+      `- Тренд: ${calcTrendLabel(session.scoreHistory)}\n\n` +
+      `Улучшенная версия:\n${improvedVersion}\n\n` +
+      `Пример хорошего ответа:\n${templateExample}`
+    : `Фидбек (Free):\nОценка: ${scoreForStats}/5\n\n` +
+      `Подсказка:\n- ${(hintLines[0] || "Добавьте больше конкретики и вопрос клиенту.").trim()}\n\n` +
+      `Короткий пример:\n${templateExample.split("\n")[0]}\n\n` +
+      `Хотите подробный разбор и больше сценариев? Откройте PRO за 299 ₽. Напишите админу: ${ADMIN_USERNAME}`;
   await ctx.reply(feedbackText, resultKeyboard());
   pushDialogHistory(session, "assistant", trimForHistory(feedbackText));
+
+  if (!isProPlan(session) && session.scenariosCompletedCount >= 2 && !session.freeUpsellShown) {
+    session.freeUpsellShown = true;
+    const upsell =
+      `Если хотите больше уровней и сценариев, можно открыть полную версию PRO за 299 ₽ (разовая оплата).\n\n` +
+      `Вы получите:\n${proValueBullets()}\n\n` +
+      `Для активации напишите админу: ${ADMIN_USERNAME}`;
+    await ctx.reply(upsell, paywallKeyboard());
+    pushDialogHistory(session, "assistant", trimForHistory(upsell));
+  }
 });
 
 bot.catch((err) => {
@@ -851,6 +1138,7 @@ bot.catch((err) => {
 async function initAndLaunch() {
   console.log("Starting bot...");
   await ensureBusinessSchema();
+  await ensureAccessSchema();
   const data = await getBusinessData();
   SCENARIOS = data.scenarios;
   EVALUATION_RULES = data.evaluationRules;

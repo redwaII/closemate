@@ -15,6 +15,7 @@ const sessions = new Map();
 function getDefaultSession() {
   return {
     state: STATES.MAIN_MENU,
+    plan: "free",
     selectedScenarioId: null,
     experienceLevel: null,
     attemptsInScenario: 0,
@@ -28,6 +29,7 @@ function getDefaultSession() {
       mid: {},
       advanced: {},
     },
+    freeUpsellShown: false,
     profile: {
       completed: false,
       step: null,
